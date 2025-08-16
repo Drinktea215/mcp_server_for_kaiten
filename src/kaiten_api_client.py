@@ -1,4 +1,8 @@
+import asyncio
 import logging
+import random
+import time
+
 import httpx
 from typing import List, Any
 
@@ -14,27 +18,65 @@ class KaitenApiClient:
             "Accept": "application/json",
         }
         self._client = httpx.AsyncClient(base_url=self.base_url, headers=self.headers)
+        self._semaphore = asyncio.Semaphore(5)  # максимум 5 запросов в секунду
+        self._last_requests = []  # таймстемпы последних запросов
+
+    async def _acquire_slot(self):
+        # Ограничение по 5 запросов в секунду (rate limit)
+        async with self._semaphore:
+            now = time.monotonic()
+            self._last_requests = [t for t in self._last_requests if now - t < 1.0]
+            if len(self._last_requests) >= 5:
+                sleep_time = 1.0 - (now - self._last_requests[0])
+                if sleep_time > 0:
+                    await asyncio.sleep(sleep_time)
+            self._last_requests.append(time.monotonic())
 
     async def close(self):
         await self._client.aclose()
 
     async def _request(self, method: str, url: str, **kwargs) -> Any:
-        try:
-            resp = await self._client.request(method, url, **kwargs)
-            resp.raise_for_status()
-            logger.info(f"{method} {url} succeeded with status {resp.status_code}")
-            data = resp.json()
-            logger.debug(f"Response JSON: {data}")
-            return data
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error {e.response.status_code} during {method} {url}: {e.response.text}")
-            raise
-        except httpx.RequestError as e:
-            logger.error(f"Network error during {method} {url}: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error during {method} {url}: {e}")
-            raise
+        max_retries = 5
+        retry_count = 0
+        backoff_base = 1
+
+        while True:
+            await self._acquire_slot()
+            try:
+                resp = await self._client.request(method, url, **kwargs)
+                if resp.status_code == 429:
+                    reset = resp.headers.get("X-RateLimit-Reset")
+                    now = time.time()
+                    if reset:
+                        try:
+                            reset_time = float(reset)
+                            wait_time = max(reset_time - now, 0)
+                        except ValueError:
+                            wait_time = backoff_base * (2 ** retry_count) + random.uniform(0, 1)
+                    else:
+                        wait_time = backoff_base * (2 ** retry_count) + random.uniform(0, 1)
+
+                    logger.warning(f"Rate limit exceeded, retrying after {wait_time:.2f} seconds...")
+                    await asyncio.sleep(wait_time)
+                    retry_count += 1
+                    if retry_count > max_retries:
+                        resp.raise_for_status()
+                    continue
+
+                resp.raise_for_status()
+                logger.info(f"{method} {url} succeeded with status {resp.status_code}")
+                data = resp.json()
+                logger.debug(f"Response JSON: {data}")
+                return data
+            except httpx.HTTPStatusError as e:
+                logger.error(f"HTTP error {e.response.status_code} during {method} {url}: {e.response.text}")
+                raise
+            except httpx.RequestError as e:
+                logger.error(f"Network error during {method} {url}: {e}")
+                raise
+            except Exception as e:
+                logger.error(f"Unexpected error during {method} {url}: {e}")
+                raise
 
     # Пространства
     async def spaces_list(self) -> List[Any]:
